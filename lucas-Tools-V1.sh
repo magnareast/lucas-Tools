@@ -267,7 +267,6 @@ patch_ui_api() {
 }
 
 # --- 核心部署与双模调度引擎 ---
-# 👇 将默认兜底参数改为 TUN
 deploy_mihomo_core() {
     local target_mode=${1:-"TUN"}
     local is_switch=$2
@@ -511,7 +510,6 @@ EOF
 }
 
 # --- 部署向导菜单 ---
-# 👇 修改菜单提示，将 TUN 设为默认选项
 deploy_mihomo_menu() {
     clear
     echo -e "${CYAN}--- Mihomo 部署向导 ---${NC}"
@@ -538,27 +536,48 @@ update_system() {
     pause_to_return
 }
 
+# 👇 终极完美版：BBR 网络加速、全局连接数优化 (nf_conntrack)、UDP大图文吞吐与网卡硬件调优
 enable_bbr() {
     current_bbr=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     echo -e "${YELLOW}当前拥塞控制算法: ${current_bbr:-未知}${NC}\n"
-    if [ "$current_bbr" == "bbr" ]; then echo -e "${GREEN}BBR 已经处于开启状态。${NC}"
-    else
-        read -p "是否开启 BBR 网络加速与网卡硬件级调优? [y/N/0返回]: " choice
-        if [[ "$choice" =~ ^[Yy]$ ]]; then
-            if ! lsmod | grep -q bbr; then modprobe tcp_bbr 2>/dev/null || true; echo "tcp_bbr" > /etc/modules-load.d/bbr.conf; fi
-            echo "net.core.default_qdisc=fq" > /etc/sysctl.d/99-lucas-bbr.conf
-            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-lucas-bbr.conf
-            sysctl --system >/dev/null 2>&1; echo -e "${GREEN}BBR 已成功开启！${NC}"
+    
+    read -p "是否执行 BBR、连接数扩容、UDP缓冲区优化与网卡硬件级调优? (可重复执行) [y/N/0返回]: " choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        if ! lsmod | grep -q bbr; then modprobe tcp_bbr 2>/dev/null || true; echo "tcp_bbr" > /etc/modules-load.d/bbr.conf; fi
+        
+        # 1. 写入基础 BBR 与 TCP 高阶配置
+        echo "net.core.default_qdisc=fq" > /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.ipv4.tcp_fastopen=3" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.ipv4.tcp_fin_timeout=15" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.ipv4.tcp_tw_reuse=1" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.ipv4.ip_local_port_range=1024 65535" >> /etc/sysctl.d/99-lucas-bbr.conf
+        
+        # 2. 针对 TUIC/Hy2 的核心优化：UDP 缓冲区核弹级扩容 (32MB)
+        echo "net.core.rmem_max=33554432" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.core.wmem_max=33554432" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.core.rmem_default=8388608" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.core.wmem_default=8388608" >> /etc/sysctl.d/99-lucas-bbr.conf
+        
+        # 3. 防断流神级优化：注入全局并发连接数上限扩展
+        modprobe nf_conntrack 2>/dev/null || true
+        echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf 2>/dev/null || true
+        echo "net.netfilter.nf_conntrack_max=1048576" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.netfilter.nf_conntrack_tcp_timeout_established=7200" >> /etc/sysctl.d/99-lucas-bbr.conf
+        echo "net.netfilter.nf_conntrack_tcp_timeout_time_wait=120" >> /etc/sysctl.d/99-lucas-bbr.conf
+
+        sysctl --system >/dev/null 2>&1
+        echo -e "${GREEN}BBR、UDP大图文吞吐及系统底层连接池扩容已成功开启！${NC}"
+        
+        echo -e "\n${YELLOW}正在执行直通网卡硬件级极限调优 (队列扩展与卸载)...${NC}"
+        active_iface=$(ip -4 route show default | grep -v "mihomo" | grep -v "tun" | awk '/default/ {print $5}' | head -n 1)
+        [ -z "$active_iface" ] && active_iface=$(ip link | awk -F: '$0 !~ "lo|vir|wl|mihomo|tun|^[^0-9]"{print $2;getline}' | head -n 1 | tr -d ' ')
+        
+        if [ -n "$active_iface" ]; then
+            ethtool -G "$active_iface" rx 4096 tx 4096 2>/dev/null || true
+            ethtool -K "$active_iface" tso on gso on gro on 2>/dev/null || true
             
-            echo -e "\n${YELLOW}正在执行直通网卡硬件级极限调优 (队列扩展与卸载)...${NC}"
-            active_iface=$(ip -4 route show default | grep -v "mihomo" | grep -v "tun" | awk '/default/ {print $5}' | head -n 1)
-            [ -z "$active_iface" ] && active_iface=$(ip link | awk -F: '$0 !~ "lo|vir|wl|mihomo|tun|^[^0-9]"{print $2;getline}' | head -n 1 | tr -d ' ')
-            
-            if [ -n "$active_iface" ]; then
-                ethtool -G "$active_iface" rx 4096 tx 4096 2>/dev/null || true
-                ethtool -K "$active_iface" tso on gso on gro on 2>/dev/null || true
-                
-                cat <<EOF > /etc/systemd/system/ethtool-tune.service
+            cat <<EOF > /etc/systemd/system/ethtool-tune.service
 [Unit]
 Description=Ethtool Hardware NIC Tuning
 After=network.target
@@ -572,12 +591,11 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload
-                systemctl enable ethtool-tune.service >/dev/null 2>&1
-                echo -e "${GREEN}网卡 $active_iface 硬件加速调优完成并已固化重启配置！${NC}"
-            else
-                echo -e "${RED}未检测到活动物理网卡，硬件调优跳过。${NC}"
-            fi
+            systemctl daemon-reload
+            systemctl enable ethtool-tune.service >/dev/null 2>&1
+            echo -e "${GREEN}网卡 $active_iface 硬件加速调优完成并已固化重启配置！${NC}"
+        else
+            echo -e "${RED}未检测到活动物理网卡，硬件调优跳过。${NC}"
         fi
     fi
     pause_to_return
@@ -1253,7 +1271,7 @@ while true; do
     echo -e " 大陆网络连通性: ${cn_status}\t海外网络连通性: ${out_status}"
     echo -e "${CYAN}================================================================${NC}"
     echo "  1. 📦 更新 Linux 系统 & 软件"
-    echo "  2. ⚡ 开启 BBR 网络加速 (含网卡硬件极限调优)"
+    echo "  2. ⚡ 开启 BBR、并发连接扩容与网卡硬件极限调优"
     echo "  3. 🛡️  系统防火墙设置"
     echo "  4. 🌐 系统网络底层修改 (智能向导)"
     echo "  5. 🛣️ 开启 IP 转发 (核心路由功能)"
