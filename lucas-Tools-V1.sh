@@ -536,12 +536,12 @@ update_system() {
     pause_to_return
 }
 
-# 👇 终极完美版：BBR 网络加速、全局连接数优化 (nf_conntrack)、UDP大图文吞吐与网卡硬件调优
+# 👇 完美稳定版：BBR 网络加速、全局连接数优化 (nf_conntrack)、UDP 大图文吞吐调优
 enable_bbr() {
     current_bbr=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     echo -e "${YELLOW}当前拥塞控制算法: ${current_bbr:-未知}${NC}\n"
     
-    read -p "是否执行 BBR、连接数扩容、UDP缓冲区优化与网卡硬件级调优? (可重复执行) [y/N/0返回]: " choice
+    read -p "是否执行 BBR、连接数扩容与 UDP 缓冲区优化? (可重复执行) [y/N/0返回]: " choice
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         if ! lsmod | grep -q bbr; then modprobe tcp_bbr 2>/dev/null || true; echo "tcp_bbr" > /etc/modules-load.d/bbr.conf; fi
         
@@ -568,35 +568,6 @@ enable_bbr() {
 
         sysctl --system >/dev/null 2>&1
         echo -e "${GREEN}BBR、UDP大图文吞吐及系统底层连接池扩容已成功开启！${NC}"
-        
-        echo -e "\n${YELLOW}正在执行直通网卡硬件级极限调优 (队列扩展与卸载)...${NC}"
-        active_iface=$(ip -4 route show default | grep -v "mihomo" | grep -v "tun" | awk '/default/ {print $5}' | head -n 1)
-        [ -z "$active_iface" ] && active_iface=$(ip link | awk -F: '$0 !~ "lo|vir|wl|mihomo|tun|^[^0-9]"{print $2;getline}' | head -n 1 | tr -d ' ')
-        
-        if [ -n "$active_iface" ]; then
-            ethtool -G "$active_iface" rx 4096 tx 4096 2>/dev/null || true
-            ethtool -K "$active_iface" tso on gso on gro on 2>/dev/null || true
-            
-            cat <<EOF > /etc/systemd/system/ethtool-tune.service
-[Unit]
-Description=Ethtool Hardware NIC Tuning
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=-/sbin/ethtool -G $active_iface rx 4096 tx 4096
-ExecStart=-/sbin/ethtool -K $active_iface tso on gso on gro on
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload
-            systemctl enable ethtool-tune.service >/dev/null 2>&1
-            echo -e "${GREEN}网卡 $active_iface 硬件加速调优完成并已固化重启配置！${NC}"
-        else
-            echo -e "${RED}未检测到活动物理网卡，硬件调优跳过。${NC}"
-        fi
     fi
     pause_to_return
 }
@@ -658,9 +629,10 @@ firewall_setup() {
     done
 }
 
+# --- 关键重写逻辑：适配单 DNS 下发，防 YAML 报错 ---
 write_network_config() {
     local mode=$1; local iface=$2; local ip=$3; local gw=$4; local mgr=$5
-    local dns1=${6:-223.5.5.5}; local dns2=${7:-119.29.29.29}
+    local dns1=$6; local dns2=$7
     echo -e "\n${YELLOW}正在通过 $mgr 引擎安全重写底层网络配置...${NC}"
     
     if [ -d /etc/cloud/cloud.cfg.d ]; then
@@ -671,7 +643,11 @@ write_network_config() {
         con_name=$(nmcli -t -f NAME,DEVICE con show --active | grep ":$iface" | cut -d: -f1 | head -n 1)
         [ -z "$con_name" ] && con_name="$iface"
         if [ "$mode" == "dhcp" ]; then nmcli con mod "$con_name" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
-        else nmcli con mod "$con_name" ipv4.method manual ipv4.addresses "$ip" ipv4.gateway "$gw" ipv4.dns "$dns1 $dns2"; fi
+        else 
+            local dns_str="$dns1"
+            [ -n "$dns2" ] && dns_str="$dns1 $dns2"
+            nmcli con mod "$con_name" ipv4.method manual ipv4.addresses "$ip" ipv4.gateway "$gw" ipv4.dns "$dns_str"
+        fi
     elif [ "$mgr" == "Netplan" ]; then
         local net_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n 1)
         [ -z "$net_file" ] && net_file="/etc/netplan/01-netcfg.yaml"
@@ -686,7 +662,11 @@ EOF
         else
             echo "      dhcp4: false" >> "$net_file"; echo "      addresses: [$ip]" >> "$net_file"
             [ -n "$gw" ] && echo -e "      routes:\n        - to: default\n          via: $gw" >> "$net_file"
-            echo -e "      nameservers:\n        addresses: [$dns1, $dns2]" >> "$net_file"
+            if [ -z "$dns2" ]; then
+                echo -e "      nameservers:\n        addresses: [$dns1]" >> "$net_file"
+            else
+                echo -e "      nameservers:\n        addresses: [$dns1, $dns2]" >> "$net_file"
+            fi
         fi
         chmod 600 "$net_file"
     elif [ "$mgr" == "systemd-networkd" ]; then
@@ -702,7 +682,8 @@ EOF
         else
             echo "Address=$ip" >> "$net_file"
             [ -n "$gw" ] && echo "Gateway=$gw" >> "$net_file"
-            echo "DNS=$dns1" >> "$net_file"; echo "DNS=$dns2" >> "$net_file"
+            echo "DNS=$dns1" >> "$net_file"
+            [ -n "$dns2" ] && echo "DNS=$dns2" >> "$net_file"
         fi
     else # ifupdown
         local net_file="/etc/network/interfaces"
@@ -720,7 +701,11 @@ EOF
             echo "iface $iface inet static" >> "$net_file"
             echo "    address $ip" >> "$net_file"
             [ -n "$gw" ] && echo "    gateway $gw" >> "$net_file"
-            echo "    dns-nameservers $dns1 $dns2" >> "$net_file"
+            if [ -z "$dns2" ]; then
+                echo "    dns-nameservers $dns1" >> "$net_file"
+            else
+                echo "    dns-nameservers $dns1 $dns2" >> "$net_file"
+            fi
         fi
     fi
 }
@@ -818,14 +803,11 @@ EOF
                     read -p "是否需要修改网关？输入新网关 IP [直接回车保持 $current_gw]: " new_gw
                     new_gw=${new_gw:-$current_gw}
                     
-                    current_dns_arr=($(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}'))
-                    default_dns1=${current_dns_arr[0]:-223.5.5.5}
-                    default_dns2=${current_dns_arr[1]:-119.29.29.29}
-                    
-                    read -p "请输入首选 DNS [直接回车保持 $default_dns1]: " new_dns1
-                    new_dns1=${new_dns1:-$default_dns1}
-                    read -p "请输入备用 DNS [直接回车保持 $default_dns2]: " new_dns2
-                    new_dns2=${new_dns2:-$default_dns2}
+                    # --- 已完全移除原来的固定 223/119 DNS 数组逻辑，直接指向刚刚确定的网关 ---
+                    read -p "请输入首选 DNS [直接回车默认为网关IP: $new_gw]: " new_dns1
+                    new_dns1=${new_dns1:-$new_gw}
+                    read -p "请输入备用 DNS [直接回车默认留空不填写]: " new_dns2
+                    # new_dns2 留空即为空字符串
 
                     write_network_config "static" "$active_iface" "$new_ip" "$new_gw" "$net_mgr" "$new_dns1" "$new_dns2"
                     
@@ -862,13 +844,11 @@ EOF
                 fi; pause_to_return ;;
             3)
                 echo -e "\n${YELLOW}旁路由自身系统 DNS 配置向导:${NC}"
-                current_dns_arr=($(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}'))
-                default_dns1=${current_dns_arr[0]:-223.5.5.5}
-                default_dns2=${current_dns_arr[1]:-119.29.29.29}
-                read -p "请输入首选 DNS (回车保持 $default_dns1): " dns1
-                dns1=${dns1:-$default_dns1}
-                read -p "请输入备用 DNS (回车保持 $default_dns2): " dns2
-                dns2=${dns2:-$default_dns2}
+                
+                # --- 已修改为默认读取当前主路由网关，备用留空 ---
+                read -p "请输入首选 DNS [直接回车默认为网关IP: $current_gw]: " dns1
+                dns1=${dns1:-$current_gw}
+                read -p "请输入备用 DNS [直接回车默认留空不填写]: " dns2
                 
                 chattr -i /etc/resolv.conf 2>/dev/null
                 if systemctl is-active --quiet systemd-resolved; then systemctl disable --now systemd-resolved; fi
@@ -1271,7 +1251,7 @@ while true; do
     echo -e " 大陆网络连通性: ${cn_status}\t海外网络连通性: ${out_status}"
     echo -e "${CYAN}================================================================${NC}"
     echo "  1. 📦 更新 Linux 系统 & 软件"
-    echo "  2. ⚡ 开启 BBR、并发连接扩容与网卡硬件极限调优"
+    echo "  2. ⚡ 开启 BBR、并发连接池扩容与 UDP 吞吐优化"
     echo "  3. 🛡️  系统防火墙设置"
     echo "  4. 🌐 系统网络底层修改 (智能向导)"
     echo "  5. 🛣️ 开启 IP 转发 (核心路由功能)"
